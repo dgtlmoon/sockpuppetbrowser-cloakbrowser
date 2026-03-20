@@ -152,7 +152,17 @@ def is_profile_in_use(udd: str) -> bool:
     except OSError as e:
         import errno as errno_mod
         if e.errno == errno_mod.ESRCH:
-            return False  # PID is gone → stale lock → slot is free
+            # PID is gone → stale lock. Delete it so Chrome can start cleanly.
+            # This also handles cross-hostname stale locks (e.g. left by a
+            # previous container run) — Chrome refuses to start if the hostname
+            # in SingletonLock doesn't match the current machine, even when the
+            # PID is dead, so we must remove the file rather than just skip it.
+            try:
+                os.unlink(lock_path)
+                logger.debug(f"Removed stale SingletonLock {lock_path} (PID {pid} no longer running)")
+            except OSError:
+                pass
+            return False
         return True       # EPERM (pid exists, wrong owner) or EINVAL (not a symlink) → skip slot
     except (ValueError, IndexError):
         return True       # couldn't parse hostname-PID format → skip slot to be safe
