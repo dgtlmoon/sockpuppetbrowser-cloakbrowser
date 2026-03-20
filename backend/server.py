@@ -159,7 +159,7 @@ def is_profile_in_use(udd: str) -> bool:
             # PID is dead, so we must remove the file rather than just skip it.
             try:
                 os.unlink(lock_path)
-                logger.debug(f"Removed stale SingletonLock {lock_path} (PID {pid} no longer running)")
+                logger.info(f"Removed stale SingletonLock {lock_path} (PID {pid} no longer running)")
             except OSError:
                 pass
             return False
@@ -271,13 +271,14 @@ async def launch_chrome(port=19222, url_query="", headful=False, websocket=None)
     # (base, base-2, base-3 …) so concurrent sessions never collide on the
     # same profile directory and trigger Chrome's ProcessSingleton error.
     resolved_query_args = []
+    caller_udd = None   # the resolved caller-supplied UDD, if any
     for arg in query_args:
         if arg.startswith('--user-data-dir='):
             base_udd = arg.split('=', 1)[1]
-            resolved = find_available_udd(base_udd)
-            if resolved != base_udd:
-                logger.info(f"user-data-dir {base_udd!r} in use, using slot {resolved!r}")
-            resolved_query_args.append(f'--user-data-dir={resolved}')
+            caller_udd = find_available_udd(base_udd)
+            if caller_udd != base_udd:
+                logger.info(f"user-data-dir {base_udd!r} in use, using slot {caller_udd!r}")
+            resolved_query_args.append(f'--user-data-dir={caller_udd}')
         else:
             resolved_query_args.append(arg)
     chrome_args += resolved_query_args
@@ -289,10 +290,11 @@ async def launch_chrome(port=19222, url_query="", headful=False, websocket=None)
         else:
             logger.warning("No --window-size in query, and no SCREEN_HEIGHT + SCREEN_WIDTH env vars found :-(")
 
-    # Each browser gets its own isolated profile dir; stored on the process
-    # object so cleanup_chrome_by_pid can delete it after the browser exits.
-    user_data_dir = None
-    if '--user-data-dir' not in url_query:
+    # Track which UDD this Chrome is using so cleanup can remove SingletonLock
+    # after a SIGKILL (Chrome won't clean it up itself in that case).
+    # For auto-created temp dirs we also optionally delete the whole dir.
+    user_data_dir = caller_udd  # None if no --user-data-dir in query
+    if caller_udd is None:
         try:
             user_data_dir = tempfile.mkdtemp(prefix="cloak-proxy", dir="/tmp")
             chrome_args.append(f"--user-data-dir={user_data_dir}")
@@ -471,19 +473,27 @@ async def _kill_and_reap_chrome(chrome_process, websocket_id: str):
     # accidentally steal an exit status from a process asyncio is still tracking.
     reap_zombies()
 
-    # Only remove auto-created profile dirs, and only when explicitly enabled.
-    # Keeping them around lets Chrome reuse its disk cache across sessions,
-    # which speeds up page loads.  Caller-supplied dirs are never touched.
     udd = getattr(chrome_process, 'user_data_dir', None)
-    if udd and udd.startswith('/tmp/cloak-proxy') and os.path.isdir(udd):
-        if CLEANUP_PARALLEL_USER_DATA_DIR:
+    if udd and os.path.isdir(udd):
+        # Always remove SingletonLock after a SIGKILL — Chrome can't clean it
+        # up itself, and a stale lock blocks the next session from using this slot.
+        lock_path = os.path.join(udd, 'SingletonLock')
+        try:
+            os.unlink(lock_path)
+            logger.debug(f"WebSocket ID: {websocket_id} - Removed SingletonLock from {udd}")
+        except FileNotFoundError:
+            pass  # already gone, that's fine
+        except OSError as e:
+            logger.warning(f"WebSocket ID: {websocket_id} - Could not remove SingletonLock from {udd}: {e}")
+
+        # Delete the entire dir only for auto-created temp dirs and only when
+        # explicitly enabled — keeping them lets Chrome reuse its disk cache.
+        if udd.startswith('/tmp/cloak-proxy') and CLEANUP_PARALLEL_USER_DATA_DIR:
             try:
                 shutil.rmtree(udd, ignore_errors=True)
                 logger.debug(f"WebSocket ID: {websocket_id} - Removed auto-created user-data-dir {udd}")
             except Exception as e:
                 logger.warning(f"WebSocket ID: {websocket_id} - Could not remove user-data-dir {udd}: {e}")
-        else:
-            logger.debug(f"WebSocket ID: {websocket_id} - Keeping auto-created user-data-dir {udd} for cache reuse")
 
 
 async def cleanup_chrome_by_pid(chrome_process, time_at_start=0.0, websocket=None):
