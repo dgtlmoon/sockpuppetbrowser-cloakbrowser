@@ -1,0 +1,81 @@
+version: "3"
+services:
+  app:
+    build:
+      context: .
+      args:
+        # Pin to a specific cloakbrowser pip version to lock the Chromium version.
+        # Each package version ships a different Chromium build.
+        # Leave empty to use the latest available version.
+        # Example: CLOAKBROWSER_PIP_VERSION=0.3.18
+        CLOAKBROWSER_PIP_VERSION: ${CLOAKBROWSER_PIP_VERSION:-}
+    cap_add:
+      - SYS_ADMIN
+    ports:
+      # WARNING! Bind to a specific local IP in production, not 0.0.0.0.
+      # CDP gives full JS execution and file read access to anyone who connects.
+      - "3000:3000"   # ws://...:3000  CDP proxy endpoint
+      - "8080:8080"   # http://...:8080/stats  statistics endpoint
+    # The chrome.json seccomp profile is NOT enabled by default here.
+    # The original sockpuppetbrowser needed it because Alpine's Docker default
+    # seccomp blocked many Chrome syscalls.  python:3.12-slim (Debian bookworm)
+    # uses Docker's own default seccomp which is already permissive enough.
+    # chrome.json is kept in the repo (updated for Chromium 145+ syscalls) and
+    # can be re-enabled if you need extra syscall hardening:
+    #
+    # security_opt:
+    #   - seccomp:./chrome.json
+    environment:
+      # --- Concurrency & resource limits ---
+      - MAX_CONCURRENT_CHROME_PROCESSES=${MAX_CONCURRENT_CHROME_PROCESSES:-10}
+      # Minimum free RAM in MB before new connections are rejected.
+      # Uses available (free + reclaimable cache), not raw usage %.
+      # Each headless Chrome needs roughly 150-300 MB; tune to your instance size.
+      - MIN_AVAILABLE_MEMORY_MB=${MIN_AVAILABLE_MEMORY_MB:-500}
+      - DROP_EXCESS_CONNECTIONS=${DROP_EXCESS_CONNECTIONS:-False}
+      - STARTUP_DELAY=${STARTUP_DELAY:-0}
+
+      # --- Display / headful mode ---
+      - CHROME_HEADFUL=${CHROME_HEADFUL:-false}
+      - ENABLE_XVFB=${ENABLE_XVFB:-false}
+      - SCREEN_WIDTH=${SCREEN_WIDTH:-1920}
+      - SCREEN_HEIGHT=${SCREEN_HEIGHT:-1080}
+
+      # --- CloakBrowser fingerprint spoofing ---
+      # Seed for deterministic fingerprint generation. Leave empty for a random
+      # fingerprint per browser instance (recommended for anti-detect use).
+      - FINGERPRINT_SEED=${FINGERPRINT_SEED:-}
+      # Spoof OS platform reported to sites. Options: windows, macos, linux.
+      # "windows" is the most common desktop platform and the safest default.
+      - FINGERPRINT_PLATFORM=${FINGERPRINT_PLATFORM:-windows}
+      # Additional fingerprint overrides (passed directly as Chrome CLI flags):
+      #   EXTRA_FINGERPRINT_ARGS=--fingerprint-hardware-concurrency=8 --fingerprint-device-memory=8
+      - EXTRA_FINGERPRINT_ARGS=${EXTRA_FINGERPRINT_ARGS:-}
+
+      # --- WebRTC / privacy leak prevention ---
+      # Block WebRTC entirely. Prevents IP address leaks through media connections.
+      - BLOCK_WEBRTC=${BLOCK_WEBRTC:-true}
+      # WebRTC IP handling policy. Only used when BLOCK_WEBRTC=false.
+      # Options: default, default_public_and_private_interfaces,
+      #          default_public_interface_only, disable_non_proxied_udp
+      - WEBRTC_IP_HANDLING_POLICY=${WEBRTC_IP_HANDLING_POLICY:-disable_non_proxied_udp}
+
+      # --- CloakBrowser backend ---
+      # "patchright" adds extra suppression of CDP automation signals on top of
+      # CloakBrowser's C++ fingerprint patches. Requires cloakbrowser[patchright].
+      - CLOAKBROWSER_BACKEND=${CLOAKBROWSER_BACKEND:-patchright}
+
+      # --- Logging ---
+      - LOG_LEVEL=${LOG_LEVEL:-DEBUG}
+      - STATS_REFRESH_SECONDS=${STATS_REFRESH_SECONDS:-3}
+      - ALLOW_CDP_LOG=${ALLOW_CDP_LOG:-no}
+
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    network_mode: host
+    healthcheck:
+      test: "python3 /usr/src/app/docker-health-check.py --host http://localhost"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

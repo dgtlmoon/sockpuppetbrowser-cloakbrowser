@@ -1,0 +1,6 @@
+aiohttp
+loguru
+orjson
+psutil
+requests
+websockets>=14
