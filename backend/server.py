@@ -40,6 +40,7 @@ stats = {
     'chrome_start_failures': 0,
 }
 
+
 connection_count_max = int(os.getenv('MAX_CONCURRENT_CHROME_PROCESSES', 10))
 # asyncio.Semaphore is used from async code — no polling, proper backpressure
 connection_semaphore = asyncio.Semaphore(connection_count_max)
@@ -53,6 +54,14 @@ min_available_memory_mb = int(os.getenv('MIN_AVAILABLE_MEMORY_MB', 500))
 stats_refresh_time = int(os.getenv('STATS_REFRESH_SECONDS', 3))
 STARTUP_DELAY = int(os.getenv('STARTUP_DELAY', 0))
 DROP_EXCESS_CONNECTIONS = strtobool(os.getenv('DROP_EXCESS_CONNECTIONS', 'False'))
+# Kill a proxied connection (and its Chrome/tab) if no CDP messages flow for
+# this many seconds.  Set to 0 to disable.
+IDLE_TIMEOUT_SECONDS = int(os.getenv('IDLE_TIMEOUT_SECONDS', 60))
+# Delete auto-created /tmp/cloak-proxy* profile dirs on disconnect.
+# OFF by default so Chrome's disk cache is reused across sessions, which
+# speeds up page loads.  Enable if you want a clean slate every time or
+# need to reclaim disk space.
+CLEANUP_PARALLEL_USER_DATA_DIR = strtobool(os.getenv('CLEANUP_PARALLEL_USER_DATA_DIR', 'False'))
 
 
 def get_cloak_binary():
@@ -118,6 +127,52 @@ def build_webrtc_args():
             args.append(f"--force-webrtc-ip-handling-policy={policy}")
 
     return args
+
+
+def is_profile_in_use(udd: str) -> bool:
+    """Return True if a Chrome user-data-dir is locked by a running process.
+
+    Chrome creates a SingletonLock symlink (hostname-PID) on startup and
+    removes it on clean exit.  We verify the embedded PID is still alive so
+    stale locks left by a crash don't permanently block the slot.
+
+    On any ambiguity (unreadable lock, unexpected format, permission error)
+    we conservatively return True so the caller skips to the next slot rather
+    than risk two Chrome processes colliding on the same profile.
+    """
+    lock_path = os.path.join(udd, 'SingletonLock')
+    # No lock file at all → definitely free
+    if not os.path.islink(lock_path) and not os.path.exists(lock_path):
+        return False
+    try:
+        target = os.readlink(lock_path)       # e.g. "myhostname-12345"
+        pid = int(target.rsplit('-', 1)[-1])
+        os.kill(pid, 0)                       # signal 0 = existence check only
+        return True
+    except OSError as e:
+        import errno as errno_mod
+        if e.errno == errno_mod.ESRCH:
+            return False  # PID is gone → stale lock → slot is free
+        return True       # EPERM (pid exists, wrong owner) or EINVAL (not a symlink) → skip slot
+    except (ValueError, IndexError):
+        return True       # couldn't parse hostname-PID format → skip slot to be safe
+
+
+def find_available_udd(base_udd: str, limit: int = 100) -> str:
+    """Return the first user-data-dir variant not currently in use.
+
+    Tries base_udd, then base_udd-2, base_udd-3 … base_udd-{limit}.
+    Chrome creates the directory automatically if it does not exist yet,
+    so there is no need to pre-create variants.
+    """
+    if not is_profile_in_use(base_udd):
+        return base_udd
+    for n in range(2, limit + 1):
+        candidate = f"{base_udd}-{n}"
+        if not is_profile_in_use(candidate):
+            return candidate
+    logger.warning(f"All {limit} user-data-dir slots for {base_udd} are in use, reusing slot {limit}")
+    return f"{base_udd}-{limit}"
 
 
 def getBrowserArgsFromQuery(query, dashdash=True):
@@ -201,7 +256,21 @@ async def launch_chrome(port=19222, url_query="", headful=False, websocket=None)
 
     chrome_args += build_fingerprint_args()
     chrome_args += build_webrtc_args()
-    chrome_args += query_args
+
+    # If the caller supplied --user-data-dir, find the first available slot
+    # (base, base-2, base-3 …) so concurrent sessions never collide on the
+    # same profile directory and trigger Chrome's ProcessSingleton error.
+    resolved_query_args = []
+    for arg in query_args:
+        if arg.startswith('--user-data-dir='):
+            base_udd = arg.split('=', 1)[1]
+            resolved = find_available_udd(base_udd)
+            if resolved != base_udd:
+                logger.info(f"user-data-dir {base_udd!r} in use, using slot {resolved!r}")
+            resolved_query_args.append(f'--user-data-dir={resolved}')
+        else:
+            resolved_query_args.append(arg)
+    chrome_args += resolved_query_args
 
     if '--window-size' not in url_query:
         w, h = os.getenv('SCREEN_WIDTH'), os.getenv('SCREEN_HEIGHT')
@@ -331,76 +400,85 @@ async def stats_disconnect(time_at_start=0.0, websocket=None):
     logger.debug(f"Websocket {websocket.id} - Connection ended, processed in {time.time() - time_at_start:.3f}s")
 
 
-async def cleanup_chrome_by_pid(chrome_process, time_at_start=0.0, websocket=None):
+async def _kill_and_reap_chrome(chrome_process, websocket_id: str):
+    """Kill a Chrome process tree, reap all children, and clean up its user-data-dir.
+
+    Does NOT touch any websocket — callers handle that themselves.
+    """
+    logger.debug(f"WebSocket ID: {websocket_id} Cleaning up Chrome subprocess PID {chrome_process.pid}")
+
+    # Cancel log readers before killing — they hold stream references
+    for task in getattr(chrome_process, 'logging_tasks', []):
+        if not task.done():
+            task.cancel()
+
+    # Collect child PIDs *before* killing. Chrome uses the Zygote process
+    # model: renderer, GPU, and crashpad processes are spawned as grandchildren
+    # but get reparented directly to Python when the main Chrome exits.
+    # We must call waitpid() on every one of them or they stay as zombies.
+    child_pids = set()
     try:
-        logger.debug(f"WebSocket ID: {websocket.id} Cleaning up Chrome subprocess PID {chrome_process.pid}")
-
-        # Cancel log readers before killing — they hold stream references
-        for task in getattr(chrome_process, 'logging_tasks', []):
-            if not task.done():
-                task.cancel()
-
-        # Collect child PIDs *before* killing. Chrome uses the Zygote process
-        # model: renderer, GPU, and crashpad processes are spawned as grandchildren
-        # but get reparented directly to Python when the main Chrome exits.
-        # We must call waitpid() on every one of them or they stay as zombies.
-        child_pids = set()
-        try:
-            parent_process = psutil.Process(chrome_process.pid)
-            procs = [parent_process] + parent_process.children(recursive=True)
-            child_pids = {p.pid for p in procs if p.pid != chrome_process.pid}
-            if procs:
-                logger.debug(f"WebSocket ID: {websocket.id} - Killing {len(procs)} Chrome processes")
-            for proc in procs:
-                try:
-                    proc.kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        parent_process = psutil.Process(chrome_process.pid)
+        procs = [parent_process] + parent_process.children(recursive=True)
+        child_pids = {p.pid for p in procs if p.pid != chrome_process.pid}
+        if procs:
+            logger.debug(f"WebSocket ID: {websocket_id} - Killing {len(procs)} Chrome processes")
+        for proc in procs:
             try:
-                chrome_process.kill()
-            except OSError:
+                proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-
-        # Reap the asyncio-managed root process first
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
         try:
-            await asyncio.wait_for(chrome_process.wait(), timeout=5.0)
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning(f"WebSocket ID: {websocket.id} - Error reaping main Chrome process: {e}")
+            chrome_process.kill()
+        except OSError:
+            pass
 
-        # Reap each reparented child. os.waitpid() blocks until exit, but since
-        # we just sent SIGKILL this should return almost immediately.
-        loop = asyncio.get_running_loop()
-        for pid in child_pids:
-            try:
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda p=pid: os.waitpid(p, 0)),
-                    timeout=3.0
-                )
-            except (asyncio.TimeoutError, ChildProcessError, OSError):
-                pass  # already reaped or never existed as our child
+    # Reap the asyncio-managed root process first
+    try:
+        await asyncio.wait_for(chrome_process.wait(), timeout=5.0)
+    except (asyncio.TimeoutError, Exception) as e:
+        logger.warning(f"WebSocket ID: {websocket_id} - Error reaping main Chrome process: {e}")
 
-        logger.debug(f"WebSocket ID: {websocket.id} - Reaped {len(child_pids) + 1} Chrome processes")
+    # Reap each reparented child. os.waitpid() blocks until exit, but since
+    # we just sent SIGKILL this should return almost immediately.
+    loop = asyncio.get_running_loop()
+    for pid in child_pids:
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, lambda p=pid: os.waitpid(p, 0)),
+                timeout=3.0
+            )
+        except (asyncio.TimeoutError, ChildProcessError, OSError):
+            pass  # already reaped or never existed as our child
 
-        # Sweep for late-spawned zombies. Chrome spawns crashpad processes lazily
-        # and some get reparented to us after our psutil snapshot above — they
-        # won't be in child_pids so the targeted loop above misses them.
-        # We only call waitpid on processes already in ZOMBIE state, so we won't
-        # accidentally steal an exit status from a process asyncio is still tracking.
-        reap_zombies()
+    logger.debug(f"WebSocket ID: {websocket_id} - Reaped {len(child_pids) + 1} Chrome processes")
 
-        # Only remove the user-data-dir if WE created it (prefixed cloak-proxy).
-        # If the caller supplied their own --user-data-dir in the request URL
-        # (e.g. a persistent profile with session cookies or cache), we must
-        # never touch it — that data belongs to the caller.
-        udd = getattr(chrome_process, 'user_data_dir', None)
-        if udd and udd.startswith('/tmp/cloak-proxy') and os.path.isdir(udd):
+    # Sweep for late-spawned zombies. Chrome spawns crashpad processes lazily
+    # and some get reparented to us after our psutil snapshot above — they
+    # won't be in child_pids so the targeted loop above misses them.
+    # We only call waitpid on processes already in ZOMBIE state, so we won't
+    # accidentally steal an exit status from a process asyncio is still tracking.
+    reap_zombies()
+
+    # Only remove auto-created profile dirs, and only when explicitly enabled.
+    # Keeping them around lets Chrome reuse its disk cache across sessions,
+    # which speeds up page loads.  Caller-supplied dirs are never touched.
+    udd = getattr(chrome_process, 'user_data_dir', None)
+    if udd and udd.startswith('/tmp/cloak-proxy') and os.path.isdir(udd):
+        if CLEANUP_PARALLEL_USER_DATA_DIR:
             try:
                 shutil.rmtree(udd, ignore_errors=True)
-                logger.debug(f"WebSocket ID: {websocket.id} - Removed auto-created user-data-dir {udd}")
+                logger.debug(f"WebSocket ID: {websocket_id} - Removed auto-created user-data-dir {udd}")
             except Exception as e:
-                logger.warning(f"WebSocket ID: {websocket.id} - Could not remove user-data-dir {udd}: {e}")
+                logger.warning(f"WebSocket ID: {websocket_id} - Could not remove user-data-dir {udd}: {e}")
+        else:
+            logger.debug(f"WebSocket ID: {websocket_id} - Keeping auto-created user-data-dir {udd} for cache reuse")
 
+
+async def cleanup_chrome_by_pid(chrome_process, time_at_start=0.0, websocket=None):
+    try:
+        await _kill_and_reap_chrome(chrome_process, websocket_id=websocket.id)
     except Exception as e:
         logger.error(f"WebSocket ID: {websocket.id} - Error in Chrome cleanup: {e}")
     finally:
@@ -440,6 +518,38 @@ async def _request_retry(url, num_retries=20, websocket_id='unknown'):
                 continue
 
     raise aiohttp.ClientError(f"Failed to connect to {url} after {num_retries} attempts")
+
+
+
+async def _idle_watchdog(last_activity: list, client_websocket, websocket_id: str,
+                         idle_timeout: int, proxy_tasks: list):
+    """Cancel proxy tasks and close the client websocket after *idle_timeout* seconds
+    of no inbound or outbound CDP traffic.
+
+    *last_activity* is a single-element list containing the epoch float of the
+    most recent message (mutable so both proxy coroutines can update it).
+    *proxy_tasks* is a list of asyncio.Task objects to cancel on idle expiry.
+    """
+    if idle_timeout <= 0:
+        return
+    poll_interval = min(10, idle_timeout // 2 or 1)
+    while True:
+        await asyncio.sleep(poll_interval)
+        elapsed = time.time() - last_activity[0]
+        if elapsed >= idle_timeout:
+            logger.critical(
+                f"WebSocket ID: {websocket_id} - No CDP activity for {elapsed:.0f}s "
+                f"(threshold {idle_timeout}s, remote={getattr(client_websocket, 'remote_address', '?')}). "
+                f"Closing idle connection."
+            )
+            for task in proxy_tasks:
+                if not task.done():
+                    task.cancel()
+            try:
+                await client_websocket.close()
+            except Exception:
+                pass
+            return
 
 
 async def debug_log_line(logfile_path, text):
@@ -511,13 +621,18 @@ async def launchPuppeteerChromeProxy(websocket):
     closed.add_done_callback(lambda task: asyncio.create_task(stats_disconnect(time_at_start=now, websocket=websocket)))
 
     now_before_chrome_launch = time.time()
-    port = next(port_selector)
 
     args = getBrowserArgsFromQuery(path, dashdash=False)
     headful_mode = (
         args.get('headful', '').lower() in ['true', '1'] or
         os.getenv('CHROME_HEADFUL', 'false').lower() in ['true', '1']
     )
+    debug_log = args.get('log-cdp') if args.get('log-cdp') and strtobool(os.getenv('ALLOW_CDP_LOG', 'False')) else None
+
+    if debug_log and os.path.isfile(debug_log):
+        os.unlink(debug_log)
+
+    port = next(port_selector)
 
     try:
         chrome_process = await launch_chrome(port=port, url_query=path, headful=headful_mode, websocket=websocket)
@@ -560,20 +675,20 @@ async def launchPuppeteerChromeProxy(websocket):
     chrome_websocket_url = chrome_info.get("webSocketDebuggerUrl")
     logger.debug(f"WebSocket ID: {websocket.id} proxying to local Chrome instance via CDP {chrome_websocket_url}")
 
-    args = getBrowserArgsFromQuery(path, dashdash=False)
-    debug_log = args.get('log-cdp') if args.get('log-cdp') and strtobool(os.getenv('ALLOW_CDP_LOG', 'False')) else None
-
-    if debug_log and os.path.isfile(debug_log):
-        os.unlink(debug_log)
-
+    last_activity = [time.time()]
     try:
         await debug_log_line(text=f"Attempting connection to {chrome_websocket_url}", logfile_path=debug_log)
         async with websockets.connect(chrome_websocket_url, max_size=None, max_queue=None, ping_interval=20, ping_timeout=10) as ws:
             await debug_log_line(text=f"Connected to {chrome_websocket_url}", logfile_path=debug_log)
-            taskA = asyncio.create_task(hereToChromeCDP(puppeteer_ws=ws, chrome_websocket=websocket, debug_log=debug_log))
-            taskB = asyncio.create_task(puppeteerToHere(puppeteer_ws=ws, chrome_websocket=websocket, debug_log=debug_log))
-            await taskA
-            await taskB
+            taskA = asyncio.create_task(hereToChromeCDP(puppeteer_ws=ws, chrome_websocket=websocket, debug_log=debug_log, last_activity=last_activity))
+            taskB = asyncio.create_task(puppeteerToHere(puppeteer_ws=ws, chrome_websocket=websocket, debug_log=debug_log, last_activity=last_activity))
+            watchdog = asyncio.create_task(_idle_watchdog(last_activity, websocket, websocket.id, IDLE_TIMEOUT_SECONDS, [taskA, taskB]))
+            try:
+                await taskA
+                await taskB
+            finally:
+                if not watchdog.done():
+                    watchdog.cancel()
     except Exception as e:
         for task in getattr(chrome_process, 'logging_tasks', []):
             if not task.done():
@@ -591,9 +706,11 @@ async def launchPuppeteerChromeProxy(websocket):
     await debug_log_line(text=f"Websocket {websocket.id} - Connection done!", logfile_path=debug_log)
 
 
-async def hereToChromeCDP(puppeteer_ws, chrome_websocket, debug_log=None):
+async def hereToChromeCDP(puppeteer_ws, chrome_websocket, debug_log=None, last_activity=None):
     try:
         async for message in puppeteer_ws:
+            if last_activity is not None:
+                last_activity[0] = time.time()
             if debug_log:
                 await debug_log_line(text=f"Chrome -> Puppeteer: {message[:1000]}", logfile_path=debug_log)
             logger.trace(message[:1000])
@@ -608,9 +725,11 @@ async def hereToChromeCDP(puppeteer_ws, chrome_websocket, debug_log=None):
         logger.error(f"WebSocket ID: {puppeteer_ws.id} - Error in hereToChromeCDP: {e}")
 
 
-async def puppeteerToHere(puppeteer_ws, chrome_websocket, debug_log=None):
+async def puppeteerToHere(puppeteer_ws, chrome_websocket, debug_log=None, last_activity=None):
     try:
         async for message in chrome_websocket:
+            if last_activity is not None:
+                last_activity[0] = time.time()
             if debug_log:
                 await debug_log_line(text=f"Puppeteer -> Chrome: {message[:1000]}", logfile_path=debug_log)
             logger.trace(message[:1000])
